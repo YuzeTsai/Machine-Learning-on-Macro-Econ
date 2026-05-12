@@ -1,0 +1,875 @@
+---
+title: "ML Macroecon"
+output: html_document
+date: "2026-03-17"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+install.packages("kableExtra")
+library(data.table)
+library(arrow)
+library(stringr)
+library(tidyverse)
+library(fixest)
+library(ggplot2)
+
+library(kableExtra)
+
+
+rm(list = ls()); gc()
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+DT = fread("~/Desktop/RA/Econ Sinica/Complied Data/DT3.csv")
+str(DT)
+
+
+#--------------------------------------------------
+# 0) 假設 DT 已經在環境中
+#--------------------------------------------------
+setDT(DT)
+
+#--------------------------------------------------
+# 1) 先複製一份，避免直接改原資料
+#--------------------------------------------------
+dt0 <- copy(DT)
+
+#--------------------------------------------------
+# 2) tenor 標準化：只留 3M / 2Y / 10Y
+#    這邊先靠 FullName 判斷
+#--------------------------------------------------
+dt0[, tenor := fifelse(
+  grepl("10-Year", FullName, ignore.case = TRUE), "10Y",
+  fifelse(
+    grepl("2-Year", FullName, ignore.case = TRUE), "2Y",
+    fifelse(
+      grepl("3-Month|3 Month|\\b3M\\b", FullName, ignore.case = TRUE), "3M",
+      NA_character_
+    )
+  )
+)]
+
+#--------------------------------------------------
+# 3) 先把你要的 candidate sample 拉出來
+#--------------------------------------------------
+
+
+dt_candidate <- dt0[
+  Select == 1 &
+    h_months %in% c(3L, 6L, 9L, 12L, 18L, 24L) &
+    !is.na(tenor)
+]
+
+# 檢查筆數
+cat("Candidate sample size:", nrow(dt_candidate), "\n")
+
+# 看 tenor x horizon 分布
+print(
+  dt_candidate[, .N, by = .(tenor, h_months)][order(tenor, h_months)]
+)
+
+#--------------------------------------------------
+# 4) 整理成 modeling panel 的欄位命名
+#    先保留 lineage 欄位，之後建模前可再刪
+#--------------------------------------------------
+panel_candidate <- dt_candidate[
+  ,
+  .(
+    #---------------------------
+    # identifiers / lineage
+    #---------------------------
+    country               = Country,
+    source_series_name    = FullName,
+    source_series_code    = Code_Base,
+    source_code           = Code,
+    code_sub              = `Code Sub`,
+    ticker                = Ticker,
+    cusip_code            = `CUSIP Code`,
+    
+    #---------------------------
+    # panel structure
+    #---------------------------
+    tenor                 = tenor,
+    forecast_date         = Observation_Dates_converted,
+    forecast_quarter      = Trading_Date,
+    target_date           = MaturityDate_converted,
+    horizon_months        = as.integer(h_months),
+    
+    #---------------------------
+    # target / benchmark
+    #---------------------------
+    current_yield_t       = Trading_MID_YTM_Quarter_Mean,
+    realized_yield_tph    = Trading_Value_at_Maturity,
+    bbg_consensus_tph     = Consensus_forecast_value,
+    bbg_consensus_lag1    = prev_Value_num,
+    forecast_revision     = fifelse(
+      !is.na(r_bt),
+      r_bt,
+      Consensus_forecast_value - prev_Value_num
+    ),
+    target_error_e        = fifelse(
+      !is.na(e_bth),
+      e_bth,
+      Trading_Value_at_Maturity - Consensus_forecast_value
+    ),
+    
+    #---------------------------
+    # local macro forecasts
+    #---------------------------
+    local_gdp_qoq_fcst    = GDP_QoQ_forecast,
+    local_cpi_qoq_fcst    = CPI_QoQ_forecast,
+    local_ca_qoq_fcst     = Current_Account_Prop_Quarter_forecast,
+    
+    #---------------------------
+    # U.S. rates / macro
+    #---------------------------
+    us_3m_rate            = `EC3MUS Index`,
+    us_2y_rate            = `EC2YUS Index`,
+    us_10y_rate           = `BYXYUS Index`,
+    us_gdp_qoq_fcst       = US_GDP_QoQ_forecast,
+    us_cpi_qoq_fcst       = US_CPI_QoQ_forecast,
+    us_ca_qoq_fcst        = US_Current_Account_Prop_Quarter_forecast,
+    
+    #---------------------------
+    # crisis dummies
+    #---------------------------
+    sov_debt_crisis       = as.integer(SovDebtCrisis),
+    currency_crisis       = as.integer(CurrencyCrisis),
+    banking_crisis        = as.integer(BankingCrisis),
+    crisis_data_missing   = as.integer(
+      is.na(SovDebtCrisis) | is.na(CurrencyCrisis) | is.na(BankingCrisis)
+    ),
+    
+    #---------------------------
+    # audit flags
+    #---------------------------
+    select_flag           = as.integer(Select),
+    usable_consensus_flag = as.integer(!is.na(Consensus_forecast_value)),
+    usable_target_flag    = as.integer(
+      !is.na(Trading_Value_at_Maturity) & !is.na(Consensus_forecast_value)
+    )
+  )
+]
+
+#--------------------------------------------------
+# 5) 建議排序
+#--------------------------------------------------
+setorder(panel_candidate, country, tenor, forecast_date, horizon_months)
+
+#--------------------------------------------------
+# 6) 看一下整理後結果
+#--------------------------------------------------
+str(panel_candidate)
+cat("panel_candidate rows:", nrow(panel_candidate), "\n")
+
+# usable target sample（理論上就是你真正能拿來訓練 forecast error 的樣本）
+panel_usable <- panel_candidate[usable_target_flag == 1]
+
+cat("panel_usable rows:", nrow(panel_usable), "\n")
+
+print(
+  panel_usable[, .N, by = .(tenor, horizon_months)][order(tenor, horizon_months)]
+)
+
+#--------------------------------------------------
+# 7) 檢查 key 是否重複
+#    你理想上希望一列 = country x tenor x forecast_date x horizon
+#--------------------------------------------------
+dup_key <- panel_candidate[
+  ,
+  .N,
+  by = .(country, tenor, forecast_date, horizon_months)
+][N > 1]
+
+cat("Number of duplicated keys:", nrow(dup_key), "\n")
+
+if (nrow(dup_key) > 0) {
+  print(head(dup_key[order(-N)], 20))
+}
+
+#--------------------------------------------------
+# 8) 先存檔
+#--------------------------------------------------
+fwrite(panel_candidate, "~/Desktop/Machine Learning on MacroEcon/panel_candidate_h36912.csv")
+fwrite(panel_usable,    "~/Desktop/Machine Learning on MacroEcon/panel_usable_h36912.csv")
+
+
+str(panel_candidate)
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure}
+
+#--------------------------------------------------
+# 0) 假設 panel_candidate 已經存在
+#--------------------------------------------------
+setDT(panel_candidate)
+
+#--------------------------------------------------
+# 1) 只留真正可用來預測 forecast error 的樣本
+#--------------------------------------------------
+panel_model <- copy(
+  panel_candidate[usable_target_flag == 1]
+)
+
+cat("panel_model rows:", nrow(panel_model), "\n")
+
+#--------------------------------------------------
+# 2) 類別欄位整理
+#--------------------------------------------------
+panel_model[, tenor := factor(tenor, levels = c("3M", "2Y", "10Y"))]
+panel_model[, horizon_months := factor(horizon_months, levels = c(3, 6, 9, 12, 18, 24))]
+
+#--------------------------------------------------
+# 3) crisis 變數處理
+#    主規格建議：缺值補 0 + 保留 missing flag
+#--------------------------------------------------
+for (v in c("sov_debt_crisis", "currency_crisis", "banking_crisis")) {
+  panel_model[is.na(get(v)), (v) := 0L]
+}
+
+panel_model[, crisis_data_missing := as.integer(crisis_data_missing)]
+
+#--------------------------------------------------
+# 4) 建立 ARX / ML 都會用到的主表
+#    只保留主要欄位
+#--------------------------------------------------
+panel_main <- panel_model[
+  ,
+  .(
+    #---------------------------
+    # IDs
+    #---------------------------
+    country,
+    tenor,
+    forecast_date,
+    forecast_quarter,
+    target_date,
+    horizon_months,
+
+    #---------------------------
+    # target / benchmark
+    #---------------------------
+    target_error_e,
+    current_yield_t,
+    realized_yield_tph,
+    bbg_consensus_tph,
+    bbg_consensus_lag1,
+    forecast_revision,
+
+    #---------------------------
+    # local macro
+    #---------------------------
+    local_gdp_qoq_fcst,
+    local_cpi_qoq_fcst,
+    local_ca_qoq_fcst,
+
+    #---------------------------
+    # U.S. block
+    #---------------------------
+    us_3m_rate,
+    us_2y_rate,
+    us_10y_rate,
+    us_gdp_qoq_fcst,
+    us_cpi_qoq_fcst,
+    us_ca_qoq_fcst,
+
+    #---------------------------
+    # crisis
+    #---------------------------
+    sov_debt_crisis,
+    currency_crisis,
+    banking_crisis,
+    crisis_data_missing
+  )
+]
+
+#--------------------------------------------------
+# 5) 排序
+#--------------------------------------------------
+setorder(panel_main, forecast_date, country, tenor, horizon_months)
+
+#--------------------------------------------------
+# 6) 檢查主表
+#--------------------------------------------------
+str(panel_main)
+cat("panel_main rows:", nrow(panel_main), "\n")
+print(head(panel_main, 10))
+
+#--------------------------------------------------
+# 7) 缺值摘要
+#--------------------------------------------------
+na_summary <- data.table(
+  variable = names(panel_main),
+  n_missing = sapply(panel_main, function(x) sum(is.na(x))),
+  pct_missing = sapply(panel_main, function(x) mean(is.na(x)))
+)
+
+setorder(na_summary, -pct_missing)
+print(na_summary)
+
+#--------------------------------------------------
+# 8) 看 tenor / horizon 分布
+#--------------------------------------------------
+cat("\n=== tenor distribution ===\n")
+print(panel_main[, .N, by = tenor][order(tenor)])
+
+cat("\n=== horizon distribution ===\n")
+print(panel_main[, .N, by = horizon_months][order(horizon_months)])
+
+cat("\n=== tenor x horizon distribution ===\n")
+print(panel_main[, .N, by = .(tenor, horizon_months)][order(tenor, horizon_months)])
+
+#--------------------------------------------------
+# 9) 存檔
+#--------------------------------------------------
+fwrite(panel_model, "~/Desktop/Machine Learning on MacroEcon/Data/panel_model_h36912.csv")
+fwrite(panel_main,  "~/Desktop/Machine Learning on MacroEcon/Data/panel_main_h36912.csv")
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+
+##Macro Vars (e.g. VIX, Brent Oil, GoldPrice. etc.) # 20260331 去補 2009 的資料！
+
+
+```{r}
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(lubridate)
+library(purrr)
+
+# =========================
+# 1. Read raw Excel
+# =========================
+file_path <- "~/Desktop/Machine Learning on MacroEcon/Data/Macro_Var.xlsx"
+
+macro_raw <- read_xlsx(file_path, sheet = 1, col_names = T)
+
+# 看欄名
+names(macro_raw)
+
+# 清欄名
+names(macro_raw) <- names(macro_raw) %>%
+  str_replace_all("\\s+", "_") %>%
+  str_replace_all("[^A-Za-z0-9_]", "")
+
+# 先把 Dates 改成 date
+macro_raw <- macro_raw %>%
+  rename(date = Dates)
+
+# 檢查一下
+str(macro_raw$date)
+
+# 轉型
+macro_weekly <- macro_raw %>%
+  mutate(
+    date = as.Date(date),
+    across(
+      -date,
+      ~ suppressWarnings(as.numeric(as.character(.x)))
+    )
+  ) %>%
+  filter(!is.na(date))
+
+str(macro_weekly)
+
+# quick check
+glimpse(macro_weekly)
+summary(macro_weekly$date)
+
+# =========================
+# 4. Split global vs FX
+# =========================
+all_vars <- names(macro_weekly)[names(macro_weekly) != "date"]
+
+fx_vars <- all_vars[str_detect(all_vars, "^USD[A-Z]{3}_Curncy$")]
+global_vars <- setdiff(all_vars, fx_vars)
+
+macro_global_weekly <- macro_weekly %>%
+  select(date, all_of(global_vars))
+
+macro_fx_weekly <- macro_weekly %>%
+  select(date, all_of(fx_vars))
+
+# =========================
+# 5. Create forecast_quarter
+# =========================
+macro_global_weekly <- macro_global_weekly %>%
+  mutate(forecast_quarter = paste0(year(date), "Q", quarter(date)))
+
+macro_fx_weekly <- macro_fx_weekly %>%
+  mutate(forecast_quarter = paste0(year(date), "Q", quarter(date)))
+
+# =========================
+# 6. Quarterly average: global
+# =========================
+macro_global_quarterly <- macro_global_weekly %>%
+  group_by(forecast_quarter) %>%
+  summarise(
+    across(
+      all_of(global_vars),
+      ~ mean(.x, na.rm = TRUE)
+    ),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    across(-forecast_quarter, ~ ifelse(is.nan(.x), NA_real_, .x))
+  )
+
+# =========================
+# 7. Quarterly average: FX
+# =========================
+macro_fx_quarterly_wide <- macro_fx_weekly %>%
+  group_by(forecast_quarter) %>%
+  summarise(
+    across(
+      all_of(fx_vars),
+      ~ mean(.x, na.rm = TRUE)
+    ),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    across(-forecast_quarter, ~ ifelse(is.nan(.x), NA_real_, .x))
+  )
+
+# =========================
+# 8. FX wide -> long
+# =========================
+macro_fx_quarterly_long <- macro_fx_quarterly_wide %>%
+  pivot_longer(
+    cols = -forecast_quarter,
+    names_to = "fx_ticker",
+    values_to = "fx_usd_local"
+  )
+
+# =========================
+# 9. Country <-> FX mapping
+# =========================
+fx_mapping <- tibble(
+  country = c(
+    "China", "Brazil", "Czech Republic", "Hungary", "Indonesia",
+    "South Africa", "Korea", "Malaysia", "Mexico", "Philippines",
+    "Poland", "Romania", "Russia", "Taiwan", "Thailand",
+    "Turkey", "Vietnam", "Euro Area"
+  ),
+  fx_ticker = c(
+    "USDCNY_Curncy", "USDBRL_Curncy", "USDCZK_Curncy", "USDHUF_Curncy", "USDIDR_Curncy",
+    "USDZAR_Curncy", "USDKRW_Curncy", "USDMYR_Curncy", "USDMXN_Curncy", "USDPHP_Curncy",
+    "USDPLN_Curncy", "USDRON_Curncy", "USDRUB_Curncy", "USDTWD_Curncy", "USDTHB_Curncy",
+    "USDTRY_Curncy", "USDVND_Curncy", "USDEUR_Curncy"
+  )
+)
+
+macro_fx_quarterly <- macro_fx_quarterly_long %>%
+  left_join(fx_mapping, by = "fx_ticker") %>%
+  select(country, forecast_quarter, fx_ticker, fx_usd_local)
+
+
+macro_global_quarterly <- macro_global_quarterly[, -6]
+# =========================
+# 10. Save
+# =========================
+write.csv(macro_global_quarterly, "macro_global_quarterly.csv", row.names = FALSE)
+write.csv(macro_fx_quarterly, "macro_fx_quarterly.csv", row.names = FALSE)
+
+
+names(macro_global_quarterly)
+unique(macro_fx_quarterly$country)
+head(macro_global_quarterly)
+head(macro_fx_quarterly)
+
+```
+
+## Combined
+
+```{r}
+library(data.table)
+library(dplyr)
+
+panel_main <- fread("~/Desktop/Machine Learning on MacroEcon/Data/panel_main_h36912.csv")
+
+str(panel_main)
+names(panel_main)
+unique(panel_main$country)
+
+# =========================
+# 1. Check panel_main keys
+# =========================
+# 確保 forecast_quarter 是字串
+panel_main[, forecast_quarter := as.character(forecast_quarter)]
+panel_main[, country := as.character(country)]
+
+macro_global_quarterly <- macro_global_quarterly %>%
+  mutate(forecast_quarter = str_replace(forecast_quarter, "^(\\d{4})Q([1-4])$", "\\1-Q\\2"))
+
+macro_fx_quarterly <- macro_fx_quarterly %>%
+  mutate(forecast_quarter = str_replace(forecast_quarter, "^(\\d{4})Q([1-4])$", "\\1-Q\\2"))
+
+# 看一下 panel 裡有哪些國家
+sort(unique(panel_main$country))
+
+# =========================
+# 2. Build FX mapping
+# =========================
+# 這裡請依照你 panel_main 的 country 名稱微調
+fx_mapping <- data.table(
+  country = c(
+    "Brazil",
+    "China",
+    "Czech",
+    "Hungary",
+    "Indonesia",
+    "South Korea",
+    "Malaysia",
+    "Mexico",
+    "Philippines",
+    "Poland",
+    "Romania",
+    "Russia",
+    "South Africa",
+    "Taiwan",
+    "Thailand",
+    "Turkey",
+    "Vietnam",
+    "Bulgaria" # 保加利亞使用歐元掛勾
+  ),
+  fx_ticker = c(
+    "USDBRL_Curncy",
+    "USDCNY_Curncy",
+    "USDCZK_Curncy",
+    "USDHUF_Curncy",
+    "USDIDR_Curncy",
+    "USDKRW_Curncy",
+    "USDMYR_Curncy",
+    "USDMXN_Curncy",
+    "USDPHP_Curncy",
+    "USDPLN_Curncy",
+    "USDRON_Curncy",
+    "USDRUB_Curncy",
+    "USDZAR_Curncy",
+    "USDTWD_Curncy",
+    "USDTHB_Curncy",
+    "USDTRY_Curncy",
+    "USDVND_Curncy",
+    "USDEUR_Curncy"
+  )
+)
+
+# =========================
+# 3. Create macro_fx_quarterly
+# =========================
+# 假設你前面已經有 macro_fx_quarterly_long:
+# columns = forecast_quarter, fx_ticker, fx_usd_local
+
+macro_fx_quarterly <- as.data.table(macro_fx_quarterly_long) %>%
+  left_join(fx_mapping, by = "fx_ticker") %>%
+  select(country, forecast_quarter, fx_ticker, fx_usd_local) %>%
+  as.data.table()
+
+macro_fx_quarterly <- macro_fx_quarterly %>%
+  mutate(forecast_quarter = str_replace(forecast_quarter, "^(\\d{4})Q([1-4])$", "\\1-Q\\2"))
+
+
+macro_fx_quarterly[, country := as.character(country)]
+macro_fx_quarterly[, forecast_quarter := as.character(forecast_quarter)]
+
+# 檢查 mapping 後哪些 ticker 沒對到 country
+macro_fx_quarterly[is.na(country)] %>% unique(by = "fx_ticker")
+
+# =========================
+# 4. Prepare macro_global_quarterly
+# =========================
+macro_global_quarterly <- as.data.table(macro_global_quarterly)
+macro_global_quarterly[, forecast_quarter := as.character(forecast_quarter)]
+
+# =========================
+# 5. Merge global vars
+# =========================
+panel_main_macro <- merge(
+  panel_main,
+  macro_global_quarterly,
+  by = "forecast_quarter",
+  all.x = TRUE
+)
+
+# =========================
+# 6. Merge FX vars
+# =========================
+panel_main_macro <- merge(
+  panel_main_macro,
+  macro_fx_quarterly[, .(country, forecast_quarter, fx_usd_local)],
+  by = c("country", "forecast_quarter"),
+  all.x = TRUE
+)
+
+# =========================
+# 7. Quick checks
+# =========================
+str(panel_main_macro)
+names(panel_main_macro)
+
+# 檢查合併後缺值
+colSums(is.na(panel_main_macro[, .(
+  CO1_Comdty,
+  VIX_Index,
+  XAU_Curncy,
+  XAG_Curncy,
+  fx_usd_local
+)]))
+
+# 看幾筆
+nrow(panel_main)
+nrow(panel_main_macro)
+
+# 抽樣檢查
+panel_main_macro[1:10, .(
+  country, forecast_quarter, CO1_Comdty, VIX_Index, XAU_Curncy, fx_usd_local
+)]
+
+# =========================
+# 8. Save merged panel
+# =========================
+fwrite(
+  panel_main_macro,
+  "~/Desktop/Machine Learning on MacroEcon/Data/panel_main_macro_merged.csv"
+)
+```
+
+## Summary Statistic
+```{r}
+library(data.table)
+library(knitr)
+
+# 讀資料
+dt <- fread("~/Desktop/Machine Learning on MacroEcon/Data/panel_main_macro_merged.csv")
+setDT(dt)
+
+# =========================
+# Table 1：樣本國家概覽
+# =========================
+t1 <- dt[, .(
+  N     = .N,
+  Start = as.character(min(forecast_date, na.rm = TRUE)),
+  End   = as.character(max(forecast_date, na.rm = TRUE))
+), by = country]
+
+knitr::kable(
+  t1,
+  format   = "latex",
+  booktabs = TRUE,
+  linesep  = "",
+  col.names = c("Country", "N", "Start", "End"),
+  caption  = "Sample Countries: Observation Counts and Time Coverage"
+)
+
+cat("\n\n")
+
+# =========================
+# Table 2：觀測值分布 Tenor × Horizon
+# =========================
+
+t2 <- data.table::dcast(
+  dt,
+  tenor ~ horizon_months,
+  fun.aggregate = length,
+  value.var = "target_error_e"
+)
+
+num_cols <- setdiff(names(t2), "tenor")
+
+t2[, Total := rowSums(.SD), .SDcols = num_cols]
+
+# 重新抓一次，因為現在已經多了 Total 欄
+num_cols2 <- setdiff(names(t2), "tenor")
+
+totrow <- as.data.table(
+  t(c("Total", colSums(t2[, ..num_cols2])))
+)
+setnames(totrow, names(t2))
+
+t2 <- rbind(t2, totrow, fill = TRUE)
+
+show_names <- names(t2)
+show_names[show_names != "tenor" & show_names != "Total"] <- paste0(show_names[show_names != "tenor" & show_names != "Total"], "M")
+show_names[show_names == "tenor"] <- "Tenor"
+
+knitr::kable(
+  t2,
+  format   = "latex",
+  booktabs = TRUE,
+  linesep  = "",
+  col.names = show_names,
+  caption  = "Observation Counts by Tenor and Forecast Horizon"
+)
+# =========================
+# Table 3：目標變數描述統計（按 Tenor）
+# =========================
+t3 <- dt[, .(
+  N      = sum(!is.na(target_error_e)),
+  Mean   = round(mean(target_error_e, na.rm = TRUE), 3),
+  Std    = round(sd(target_error_e, na.rm = TRUE), 3),
+  Min    = round(min(target_error_e, na.rm = TRUE), 3),
+  P25    = round(as.numeric(quantile(target_error_e, 0.25, na.rm = TRUE)), 3),
+  Median = round(median(target_error_e, na.rm = TRUE), 3),
+  P75    = round(as.numeric(quantile(target_error_e, 0.75, na.rm = TRUE)), 3),
+  Max    = round(max(target_error_e, na.rm = TRUE), 3)
+), by = tenor]
+
+allrow <- dt[, .(
+  tenor  = "All",
+  N      = sum(!is.na(target_error_e)),
+  Mean   = round(mean(target_error_e, na.rm = TRUE), 3),
+  Std    = round(sd(target_error_e, na.rm = TRUE), 3),
+  Min    = round(min(target_error_e, na.rm = TRUE), 3),
+  P25    = round(as.numeric(quantile(target_error_e, 0.25, na.rm = TRUE)), 3),
+  Median = round(median(target_error_e, na.rm = TRUE), 3),
+  P75    = round(as.numeric(quantile(target_error_e, 0.75, na.rm = TRUE)), 3),
+  Max    = round(max(target_error_e, na.rm = TRUE), 3)
+)]
+
+t3 <- rbind(t3, allrow, fill = TRUE)
+
+knitr::kable(
+  t3,
+  format   = "latex",
+  booktabs = TRUE,
+  linesep  = "",
+  caption  = "Summary Statistics of Forecast Error by Tenor (percentage points)"
+)
+
+cat("\n\\\\textit{Note:} Forecast error defined as realized yield minus professional consensus forecast.\n\n")
+
+# =========================
+# Table 4：預測誤差均值矩陣（Tenor × Horizon）
+# =========================
+t4 <- data.table::dcast(
+  dt,
+  tenor ~ horizon_months,
+  fun.aggregate = function(x) round(mean(x, na.rm = TRUE), 3),
+  value.var = "target_error_e"
+)
+
+knitr::kable(
+  t4,
+  format   = "latex",
+  booktabs = TRUE,
+  linesep  = "",
+  col.names = c("Tenor", "3M", "6M", "9M", "12M", "18M", "24M"),
+  caption  = "Mean Forecast Error by Tenor and Horizon (percentage points)"
+)
+
+cat(
+  "\n\\\\textit{Note:} Positive values indicate consensus underprediction; negative values indicate overprediction. A systematic pattern of negative errors at short horizons and positive errors at long horizons is evident across all tenors.\n\n"
+)
+
+# =========================
+# Table 5：主要 Predictor 描述統計
+# =========================
+pred_vars <- c(
+  "current_yield_t", "bbg_consensus_tph", "forecast_revision",
+  "us_10y_rate", "us_2y_rate", "VIX_Index",
+  "local_gdp_qoq_fcst", "local_cpi_qoq_fcst", "local_ca_qoq_fcst",
+  "CO1_Comdty", "SPX_Index", "fx_usd_local","us_gdp_qoq_fcst", "us_cpi_qoq_fcst", "us_ca_qoq_fcst"
+)
+
+pred_labels <- c(
+  "Current yield at forecast date",
+  "Consensus forecast of local sovereign yield",
+  "Forecast revision (consensus change from prior quarter)",
+  "U.S. 10Y yield consensus forecast (same forecast quarter)",
+  "U.S. 2Y yield consensus forecast (same forecast quarter)",
+  "VIX index (weekly, quarterly average)",
+  "Local GDP growth consensus forecast (QoQ, \\%)",
+  "Local CPI consensus forecast (QoQ, \\%)",
+  "Local current account consensus forecast (QoQ, \\%)",
+  "Brent crude oil price, CO1 (weekly, quarterly average, USD/bbl)",
+  "S\\&P 500 index (weekly, quarterly average)",
+  "FX rate: USD per local currency unit (weekly, quarterly average)",
+  "U.S. GDP growth (QoQ, %)",
+  "U.S. CPI (QoQ, %)",
+  "U.S. current account (QoQ, %)"
+)
+
+t5_df <- data.frame(
+  Variable = pred_labels,
+  N        = sapply(pred_vars, function(v) sum(!is.na(dt[[v]]))),
+  Mean     = sapply(pred_vars, function(v) round(mean(dt[[v]], na.rm = TRUE), 3)),
+  Std      = sapply(pred_vars, function(v) round(sd(dt[[v]], na.rm = TRUE), 3)),
+  Min      = sapply(pred_vars, function(v) round(min(dt[[v]], na.rm = TRUE), 3)),
+  Median   = sapply(pred_vars, function(v) round(median(dt[[v]], na.rm = TRUE), 3)),
+  Max      = sapply(pred_vars, function(v) round(max(dt[[v]], na.rm = TRUE), 3))
+)
+
+knitr::kable(
+  t5_df,
+  format   = "latex",
+  booktabs = TRUE,
+  linesep  = "",
+  row.names = FALSE,
+  escape   = FALSE,
+  caption  = "Summary Statistics of Key Predictors"
+)
+
+cat(
+  "\n\\\\textit{Note:} current\\_yield\\_t has 38\\% missing values (not available for all country-tenor combinations). fx\\_usd\\_local is reported in local currency units per USD; the large mean and standard deviation reflect cross-country variation in currency denomination.\n"
+)
+footnote(general = paste(
+  "VIX, Brent crude (CO1), S\\\\&P 500, and FX rate are constructed",
+  "from weekly observations aggregated to quarterly averages.",
+  "current\\_yield\\_t has 38\\\\% missing values.",
+  "All consensus forecast variables reflect market expectations",
+  "formed at the forecast date for the same forecast quarter."),
+  general_title = "Note:",
+  escape = FALSE)
+
+
+print(xtable(t1,
+  caption = "Sample Countries: Observation Counts and Time Coverage",
+  label   = "tab:countries"),
+  include.rownames  = FALSE,
+  booktabs          = TRUE,
+  caption.placement = "top")
+
+print(xtable(t2,
+  caption = "Observation Counts by Tenor and Forecast Horizon",
+  label   = "tab:obs"),
+  include.rownames  = FALSE,
+  booktabs          = TRUE,
+  caption.placement = "top")
+
+print(xtable(t3,
+  caption = "Summary Statistics of Forecast Error by Tenor (percentage points)",
+  label   = "tab:ferror"),
+  include.rownames  = FALSE,
+  booktabs          = TRUE,
+  caption.placement = "top")
+
+print(xtable(t4,
+  caption = "Mean Forecast Error by Tenor and Horizon (percentage points)",
+  label   = "tab:ferror_matrix"),
+  include.rownames  = FALSE,
+  booktabs          = TRUE,
+  caption.placement = "top")
+
+print(xtable(t5_df,
+  caption = "Summary Statistics of Key Predictors",
+  label   = "tab:predictors"),
+  include.rownames  = FALSE,
+  booktabs          = TRUE,
+  caption.placement = "top",
+  sanitize.text.function = identity)
+
+```
+
